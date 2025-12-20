@@ -1,0 +1,19 @@
+.DS_Store
+.idea/
+.vscode/
+
+# Backend
+gcp-backend/node_modules/
+gcp-backend/.env
+
+# Android (general)
+**/.gradle/
+**/build/
+*.iml
+local.properties
+
+# Never commit Firebase config
+android-app/app/google-services.json
+
+# Never commit real secrets
+android-app/app/src/main/java/**/Config.kt
