@@ -1,56 +1,25 @@
 package com.jayrads.unityupdater
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.systemBars
-import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.animation.*
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.CloudOff
-import androidx.compose.material.icons.filled.CloudQueue
-import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.InstallMobile
-import androidx.compose.material.icons.filled.NotificationsActive
-import androidx.compose.material.icons.filled.NotificationsOff
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Security
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.ElevatedButton
-import androidx.compose.material3.ElevatedCard
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -59,6 +28,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
@@ -70,9 +40,8 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
-    private val requestNotifPerm = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { /* UI refreshes on resume */ }
+    private val requestNotifPerm =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -98,126 +67,103 @@ private fun StatusScreen(onRequestNotificationPermission: () -> Unit) {
     val ctx = LocalContext.current
     val activity = ctx as ComponentActivity
 
-    var installedVersion by remember { mutableStateOf(AppVersion.getInstalledVersionName(ctx)) }
+    var installed by remember {
+        mutableStateOf(TargetAppVersion.getInstalled(ctx, "io.unitynodes.unityapp"))
+    }
+
     var latest by remember { mutableStateOf<LatestInfo?>(null) }
+    var isLoading by remember { mutableStateOf(false) }
     var notificationsAllowed by remember { mutableStateOf(Notifications.areAllowed(ctx)) }
-    var isLoadingLatest by remember { mutableStateOf(false) }
 
-    fun refreshAll() {
-        installedVersion = AppVersion.getInstalledVersionName(ctx)
+    var isVerifying by remember { mutableStateOf(Prefs.isVerifying(ctx)) }
+    var pendingInstall by remember { mutableStateOf(Prefs.getPendingInstall(ctx)) }
+    var downloadedPath by remember { mutableStateOf(Prefs.getApkPath(ctx)) }
+
+    var detailsExpanded by remember { mutableStateOf(false) }
+
+    fun refresh() {
+        installed = TargetAppVersion.getInstalled(ctx, "io.unitynodes.unityapp")
         notificationsAllowed = Notifications.areAllowed(ctx)
+        isVerifying = Prefs.isVerifying(ctx)
+        pendingInstall = Prefs.getPendingInstall(ctx)
+        downloadedPath = Prefs.getApkPath(ctx)
 
-        isLoadingLatest = true
+        isLoading = true
         latest = null
 
         activity.lifecycleScope.launch {
-            val fetched = withContext(Dispatchers.IO) {
+            latest = withContext(Dispatchers.IO) {
                 runCatching { ApiClient.fetchLatest() }.getOrNull()
             }
-            latest = fetched
-            isLoadingLatest = false
+            isLoading = false
         }
     }
 
     LaunchedEffect(Unit) {
-        // Only touch Firebase APIs if Firebase is initialized (google-services.json present).
-        val firebaseReady = FirebaseApp.getApps(ctx).isNotEmpty()
-        if (firebaseReady) {
-            FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->
-                runCatching { ApiClient.registerToken(ctx, token) }
+        if (FirebaseApp.getApps(ctx).isNotEmpty()) {
+            FirebaseMessaging.getInstance().token.addOnSuccessListener {
+                runCatching { ApiClient.registerToken(ctx, it) }
             }
         }
-        refreshAll()
-    }
-
-    val latestText = when {
-        isLoadingLatest -> "Checking…"
-        latest == null -> "Unavailable"
-        else -> latest!!.versionName
+        refresh()
     }
 
     val updateAvailable =
         latest != null &&
-            latest!!.versionName.isNotBlank() &&
-            latest!!.versionName != installedVersion &&
-            latest!!.apkUrl.isNotBlank()
+            latest!!.apkUrl.isNotBlank() &&
+            isLatestNewer(installed, latest!!)
 
-    // Simple heuristic: if we got latest, backend was reachable.
-    val backendConnected = latest != null
-
-    // We always pin a cert; verification happens after download.
-    val signaturePinned = true
+    val installPath = pendingInstall ?: downloadedPath
+    val isVerified = !pendingInstall.isNullOrBlank()
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .windowInsetsPadding(
-                androidx.compose.foundation.layout.WindowInsets.systemBars
-            )
-            .padding(16.dp)
-            .fillMaxSize(),
+            .systemBarsPadding()
+            .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+
         HeroHeader(
             title = "UnityNodes",
             subtitle = "Update Companion",
             status = when {
                 updateAvailable -> "Update available"
-                isLoadingLatest -> "Checking…"
+                isLoading -> "Checking…"
                 latest == null -> "Offline"
                 else -> "Up to date"
             }
         )
 
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            StatusPill(
-                icon = if (backendConnected) Icons.Filled.CloudQueue else Icons.Filled.CloudOff,
-                label = if (backendConnected) "Server" else "Offline",
-                state = if (backendConnected) PillState.Good else PillState.Bad
-            )
-            StatusPill(
-                icon = if (notificationsAllowed) Icons.Filled.NotificationsActive else Icons.Filled.NotificationsOff,
-                label = if (notificationsAllowed) "Alerts" else "Muted",
-                state = if (notificationsAllowed) PillState.Good else PillState.Warn
-            )
-            StatusPill(
-                icon = Icons.Filled.Security,
-                label = "Pinned",
-                state = if (signaturePinned) PillState.Good else PillState.Bad
-            )
-        }
-
-        ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                KeyValue("Installed", installedVersion, big = true)
-                KeyValue("Latest", latestText, big = true)
-
-                latest?.let {
-                    Text(
-                        "Published: ${it.publishedAt}",
-                        style = MaterialTheme.typography.bodySmall
-                    )
+        ElevatedCard {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                val installedPretty = if (!installed.isInstalled) {
+                    "Not installed"
+                } else {
+                    normalizeSemverString(installed.versionName) // drops "(14)" because we don’t show versionCode anymore
                 }
 
+                val latestPretty = when {
+                    isLoading -> "Checking…"
+                    latest == null -> "Unavailable"
+                    else -> {
+                        val v = normalizeSemverString(latest!!.versionName)
+                        val date = extractYyyyMmDd(latest!!.versionName) ?: extractYyyyMmDd(latest!!.publishedAt)
+                        if (!date.isNullOrBlank()) "$v ($date)" else v
+                    }
+                }
+
+                KeyValue("Installed (UnityNodes)", installedPretty, big = true)
+                KeyValue("Latest", latestPretty, big = true)
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedButton(
-                        onClick = { refreshAll() },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Icon(Icons.Filled.Refresh, contentDescription = null)
-                        Spacer(Modifier.size(8.dp))
+                    OutlinedButton(onClick = { refresh() }, Modifier.weight(1f)) {
+                        Icon(Icons.Filled.Refresh, null)
+                        Spacer(Modifier.width(6.dp))
                         Text("Refresh")
                     }
-
                     OutlinedButton(
-                        onClick = {
-                            // For paranoid users: jump right to settings if they want to verify perms, etc.
-                            Notifications.openAppDetailsSettings(ctx)
-                        },
-                        modifier = Modifier.weight(1f)
+                        onClick = { Notifications.openAppDetailsSettings(ctx) },
+                        Modifier.weight(1f)
                     ) {
                         Text("App settings")
                     }
@@ -225,203 +171,155 @@ private fun StatusScreen(onRequestNotificationPermission: () -> Unit) {
             }
         }
 
-        ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                if (!notificationsAllowed) {
-                    Text(
-                        "Notifications are off. Turn them on to get update alerts.",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
+        if (updateAvailable) {
+            ElevatedCard {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
 
-                    Button(
+                    ElevatedButton(
                         onClick = {
-                            if (Build.VERSION.SDK_INT >= 33) {
-                                val granted =
-                                    ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) ==
-                                        android.content.pm.PackageManager.PERMISSION_GRANTED
-                                if (!granted) {
-                                    onRequestNotificationPermission()
-                                    return@Button
-                                }
-                            }
-                            Notifications.openAppNotificationSettings(ctx)
+                            ApkDownloader.enqueueLatest(ctx, latest!!)
+                            isVerifying = Prefs.isVerifying(ctx)
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Icon(Icons.Filled.NotificationsActive, contentDescription = null)
-                        Spacer(Modifier.size(8.dp))
-                        Text("Enable notifications")
+                        Icon(Icons.Filled.Download, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Download update")
                     }
-                } else {
-                    Text(
-                        if (updateAvailable) "A newer version is ready." else "No updates right now.",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
 
-                    AnimatedVisibility(
-                        visible = updateAvailable,
-                        enter = fadeIn() + expandVertically(),
-                        exit = fadeOut() + shrinkVertically()
-                    ) {
-                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                            ElevatedButton(
-                                onClick = { ApkDownloader.enqueueLatest(ctx, latest!!) },
-                                modifier = Modifier.fillMaxWidth(),
-                                colors = ButtonDefaults.elevatedButtonColors()
-                            ) {
-                                Icon(Icons.Filled.Download, contentDescription = null)
-                                Spacer(Modifier.size(10.dp))
-                                Text("Download update", fontWeight = FontWeight.SemiBold)
-                            }
-
-                            val downloadedPath = Prefs.getApkPath(ctx)
-                            if (!downloadedPath.isNullOrBlank()) {
-                                OutlinedButton(
-                                    onClick = {
-                                        ctx.startActivity(
-                                            Intent(ctx, InstallActivity::class.java).apply {
-                                                putExtra(InstallActivity.EXTRA_APK_PATH, downloadedPath)
-                                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                            }
-                                        )
-                                    },
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Icon(Icons.Filled.InstallMobile, contentDescription = null)
-                                    Spacer(Modifier.size(10.dp))
-                                    Text("Install downloaded APK")
-                                }
-                            }
+                    if (isVerifying) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Verifying…")
                         }
                     }
 
-                    AnimatedVisibility(
-                        visible = !updateAvailable,
-                        enter = fadeIn() + expandVertically(),
-                        exit = fadeOut() + shrinkVertically()
-                    ) {
+                    if (!installPath.isNullOrBlank()) {
                         OutlinedButton(
-                            onClick = { refreshAll() },
+                            onClick = {
+                                if (isVerified) Prefs.clearPendingInstall(ctx)
+                                ctx.startActivity(
+                                    Intent(ctx, InstallActivity::class.java)
+                                        .putExtra(InstallActivity.EXTRA_APK_PATH, installPath)
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                )
+                            },
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Icon(Icons.Filled.CheckCircle, contentDescription = null)
-                            Spacer(Modifier.size(10.dp))
-                            Text("Check again")
+                            Icon(Icons.Filled.InstallMobile, null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Install verified update")
                         }
                     }
                 }
             }
         }
 
-        latest?.let { l ->
-            ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text("Details", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                    KeyValue("APK URL", l.apkUrl, big = false)
-                    KeyValue("Size", "${l.sizeBytes} bytes", big = false)
-                }
+        // ---------- Details ----------
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clickable { detailsExpanded = !detailsExpanded },
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text("Details", fontWeight = FontWeight.SemiBold)
+            Icon(
+                if (detailsExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                null
+            )
+        }
+
+        AnimatedVisibility(detailsExpanded) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                KeyValue("Installed versionName", installed.versionName, false)
+                KeyValue("Installed versionCode", installed.versionCode.toString(), false)
+                KeyValue("Latest versionName", latest?.versionName ?: "(unknown)", false)
             }
         }
     }
 }
 
+/* ---------------- Version comparison ---------------- */
+
+private fun isLatestNewer(
+    installed: TargetAppVersion.Installed,
+    latest: LatestInfo
+): Boolean {
+    if (!installed.isInstalled) return true
+
+    val installedSem = normalizeSemver(installed.versionName)
+    val latestSem = normalizeSemver(latest.versionName)
+
+    if (installedSem.isNotEmpty() && latestSem.isNotEmpty()) {
+        for (i in 0..2) {
+            if (latestSem[i] != installedSem[i]) {
+                return latestSem[i] > installedSem[i]
+            }
+        }
+        return false // same X.Y.Z → NOT newer
+    }
+
+    return latest.versionName != installed.versionName
+}
+
+private fun normalizeSemver(v: String): List<Int> {
+    val m = Regex("""(\d+)\.(\d+)\.(\d+)""").find(v) ?: return emptyList()
+    return listOf(
+        m.groupValues[1].toInt(),
+        m.groupValues[2].toInt(),
+        m.groupValues[3].toInt()
+    )
+}
+
+/* ---------------- UI helpers ---------------- */
+
 @Composable
 private fun HeroHeader(title: String, subtitle: String, status: String) {
     val scheme = MaterialTheme.colorScheme
 
-    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-        Box(modifier = Modifier.fillMaxWidth()) {
-            // Background graphic
+    ElevatedCard {
+        Box {
             Canvas(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(120.dp)
             ) {
-                // Soft gradient band
                 drawRect(
                     brush = Brush.linearGradient(
                         colors = listOf(
                             scheme.primary.copy(alpha = 0.28f),
                             scheme.tertiary.copy(alpha = 0.18f)
                         ),
-                        start = Offset(0f, 0f),
+                        start = Offset.Zero,
                         end = Offset(size.width, size.height)
                     )
                 )
 
-                // Decorative rings (gives “techy” look)
-                val ringColor = scheme.onSurface.copy(alpha = 0.08f)
                 drawCircle(
-                    color = ringColor,
-                    radius = size.minDimension * 0.55f,
-                    center = Offset(size.width * 0.78f, size.height * 0.45f),
+                    color = scheme.onSurface.copy(alpha = 0.08f),
+                    radius = size.minDimension * 0.45f,
+                    center = Offset(size.width * 0.8f, size.height * 0.5f),
                     style = Stroke(width = 8f)
-                )
-                drawCircle(
-                    color = ringColor,
-                    radius = size.minDimension * 0.35f,
-                    center = Offset(size.width * 0.72f, size.height * 0.55f),
-                    style = Stroke(width = 6f)
-                )
-
-                // Small “node” dots
-                val dotColor = scheme.primary.copy(alpha = 0.25f)
-                fun dot(x: Float, y: Float, r: Float) {
-                    drawCircle(color = dotColor, radius = r, center = Offset(x, y))
-                }
-                dot(size.width * 0.10f, size.height * 0.25f, 10f)
-                dot(size.width * 0.18f, size.height * 0.62f, 7f)
-                dot(size.width * 0.30f, size.height * 0.40f, 6f)
-                dot(size.width * 0.92f, size.height * 0.25f, 8f)
-
-                // A subtle “bar” element
-                drawRoundRect(
-                    color = scheme.onSurface.copy(alpha = 0.05f),
-                    topLeft = Offset(size.width * 0.12f, size.height * 0.82f),
-                    size = Size(size.width * 0.56f, 10f),
-                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(20f, 20f)
                 )
             }
 
-            // Foreground text
-            Column(
-                modifier = Modifier
-                    .padding(16.dp)
-                    .align(Alignment.CenterStart),
-                verticalArrangement = Arrangement.spacedBy(2.dp)
-            ) {
-                Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
-                Text(subtitle, style = MaterialTheme.typography.titleMedium)
-                Spacer(Modifier.size(6.dp))
-                StatusChip(status)
+
+            Column(Modifier.padding(16.dp)) {
+                Text(title, fontWeight = FontWeight.SemiBold)
+                Text(subtitle)
+                Spacer(Modifier.height(6.dp))
+                Surface(shape = CircleShape) {
+                    Text(status, Modifier.padding(horizontal = 10.dp, vertical = 4.dp))
+                }
             }
         }
     }
 }
 
 @Composable
-private fun StatusChip(text: String) {
-    Surface(
-        shape = CircleShape,
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.65f)
-    ) {
-        Text(
-            text,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-            style = MaterialTheme.typography.labelMedium
-        )
-    }
-}
-
-@Composable
 private fun KeyValue(label: String, value: String, big: Boolean) {
-    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+    Column {
         Text(label, style = MaterialTheme.typography.labelMedium)
         Text(
             value,
@@ -429,34 +327,14 @@ private fun KeyValue(label: String, value: String, big: Boolean) {
         )
     }
 }
-
-private enum class PillState { Good, Warn, Bad }
-
-@Composable
-private fun StatusPill(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, state: PillState) {
-    val scheme = MaterialTheme.colorScheme
-    val bg = when (state) {
-        PillState.Good -> scheme.primaryContainer
-        PillState.Warn -> scheme.tertiaryContainer
-        PillState.Bad -> scheme.errorContainer
-    }
-    val fg = when (state) {
-        PillState.Good -> scheme.onPrimaryContainer
-        PillState.Warn -> scheme.onTertiaryContainer
-        PillState.Bad -> scheme.onErrorContainer
-    }
-
-    Surface(
-        color = bg,
-        shape = MaterialTheme.shapes.large
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            Icon(icon, contentDescription = null, tint = fg, modifier = Modifier.size(16.dp))
-            Text(label, color = fg, style = MaterialTheme.typography.labelSmall)
-        }
-    }
+private fun extractYyyyMmDd(s: String?): String? {
+    if (s.isNullOrBlank()) return null
+    return Regex("""\d{4}-\d{2}-\d{2}""").find(s)?.value
 }
+
+private fun normalizeSemverString(v: String?): String {
+    if (v.isNullOrBlank()) return "Unknown"
+    val m = Regex("""(\d+)\.(\d+)\.(\d+)""").find(v) ?: return v
+    return "${m.groupValues[1]}.${m.groupValues[2]}.${m.groupValues[3]}"
+}
+

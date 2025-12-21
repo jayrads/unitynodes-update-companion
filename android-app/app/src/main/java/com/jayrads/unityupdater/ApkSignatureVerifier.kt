@@ -1,48 +1,80 @@
 package com.jayrads.unityupdater
 
 import android.content.Context
-import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.os.Build
-import java.io.ByteArrayInputStream
+import android.util.Log
+import java.io.File
 import java.security.MessageDigest
-import java.security.cert.CertificateFactory
-import java.security.cert.X509Certificate
 
 object ApkSignatureVerifier {
-    fun verifyPinnedCert(context: Context, apkPath: String, pinnedCertSha256Hex: String): Boolean {
-        val pm = context.packageManager
-        val flags = if (Build.VERSION.SDK_INT >= 28) {
-            PackageManager.GET_SIGNING_CERTIFICATES
-        } else {
-            @Suppress("DEPRECATION")
-            PackageManager.GET_SIGNATURES
-        }
 
-        val pkgInfo: PackageInfo = pm.getPackageArchiveInfo(apkPath, flags) ?: return false
+    private const val TAG = "ApkSignatureVerifier"
 
-        val sigBytesList: List<ByteArray> = if (Build.VERSION.SDK_INT >= 28) {
-            val signingInfo = pkgInfo.signingInfo ?: return false
-            val sigs = if (signingInfo.hasMultipleSigners()) signingInfo.apkContentsSigners
-            else signingInfo.signingCertificateHistory
-            sigs.map { it.toByteArray() }
-        } else {
-            @Suppress("DEPRECATION")
-            (pkgInfo.signatures ?: return false).map { it.toByteArray() }
-        }
+    /**
+     * Extracts SHA-256 of the signing certificate used to sign an APK file.
+     * This represents the publisher identity (TOFU).
+     */
+    fun getSignerCertSha256(ctx: Context, apkPath: String): String? {
+        return try {
+            val apkFile = File(apkPath)
+            if (!apkFile.exists()) {
+                Log.w(TAG, "APK missing at path=$apkPath")
+                return null
+            }
 
-        val cf = CertificateFactory.getInstance("X.509")
-        val pinned = pinnedCertSha256Hex.lowercase().replace(":", "").trim()
+            val pm = ctx.packageManager
+            val flags = if (Build.VERSION.SDK_INT >= 28) {
+                PackageManager.GET_SIGNING_CERTIFICATES
+            } else {
+                @Suppress("DEPRECATION")
+                PackageManager.GET_SIGNATURES
+            }
 
-        return sigBytesList.any { sigBytes ->
-            val cert = cf.generateCertificate(ByteArrayInputStream(sigBytes)) as X509Certificate
-            sha256Hex(cert.encoded) == pinned
+            val pi = pm.getPackageArchiveInfo(apkPath, flags)
+            if (pi == null) {
+                Log.e(TAG, "getPackageArchiveInfo returned null for $apkPath")
+                return null
+            }
+
+            // ✅ Critical for archive APKs: tell PM where the APK actually lives.
+            pi.applicationInfo?.sourceDir = apkPath
+            pi.applicationInfo?.publicSourceDir = apkPath
+
+            val sigBytes: ByteArray? = if (Build.VERSION.SDK_INT >= 28) {
+                val info = pi.signingInfo
+                if (info == null) {
+                    Log.e(TAG, "signingInfo is null for archive APK $apkPath")
+                    null
+                } else {
+                    val sigs = if (info.hasMultipleSigners()) {
+                        info.apkContentsSigners
+                    } else {
+                        info.signingCertificateHistory
+                    }
+                    sigs.firstOrNull()?.toByteArray()
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                pi.signatures?.firstOrNull()?.toByteArray()
+            }
+
+            if (sigBytes == null) {
+                Log.e(TAG, "No signatures found for archive APK $apkPath")
+                return null
+            }
+
+            val sha = sha256Hex(sigBytes)
+            Log.d(TAG, "Signer cert SHA-256 extracted: $sha")
+            sha
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed extracting signer cert SHA-256", t)
+            null
         }
     }
 
     private fun sha256Hex(bytes: ByteArray): String {
         val md = MessageDigest.getInstance("SHA-256")
-        md.update(bytes)
-        return md.digest().joinToString("") { "%02x".format(it) }
+        return md.digest(bytes).joinToString("") { "%02x".format(it) }
     }
 }
