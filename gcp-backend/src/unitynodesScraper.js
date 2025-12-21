@@ -21,9 +21,9 @@ function parseApacheDateTimeAsIso(dateStr, timeStr) {
 
 function extractVersionName(fileName) {
   const base = fileName.replace(/\.apk$/i, "");
-  const m = base.match(/^Unity-(.+?)\+/i);
-  return m ? m[1] : base;
+  return base.replace(/^Unity-/i, "");
 }
+
 
 export async function scrapeUnityNodesIndexForLatest(indexUrl) {
   const r = await fetch(indexUrl, { redirect: "follow" });
@@ -34,17 +34,24 @@ export async function scrapeUnityNodesIndexForLatest(indexUrl) {
   if (rows.length === 0) return null;
 
   const enriched = rows.map(row => {
-    const fileName = row.href.split("/").pop() || row.href;
-    const apkUrl = new URL(row.href, indexUrl).toString();
-    const publishedAt = parseApacheDateTimeAsIso(row.dateStr, row.timeStr);
-    return {
-      apkUrl,
-      fileName,
-      versionName: extractVersionName(fileName),
-      publishedAt,
-      sizeBytes: row.sizeBytes
-    };
-  });
+     const encodedFileName = row.href.split("/").pop() || row.href;
+
+     // decode for display fields
+     const fileName = decodeURIComponent(encodedFileName);
+
+     // keep URL encoded for fetching
+     const apkUrl = new URL(row.href, indexUrl).toString();
+
+     const publishedAt = parseApacheDateTimeAsIso(row.dateStr, row.timeStr);
+
+     return {
+       apkUrl,
+       fileName,
+       versionName: extractVersionName(fileName),
+       publishedAt,
+       sizeBytes: row.sizeBytes
+     };
+   });
 
   enriched.sort((a, b) => a.publishedAt.localeCompare(b.publishedAt));
   return enriched[enriched.length - 1];

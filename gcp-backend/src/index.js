@@ -44,36 +44,76 @@ app.post("/registerToken", requireApiKey, async (req, res) => {
 });
 
 app.post("/scrape", requireApiKey, async (_req, res) => {
-  if (!UNITYNODES_INDEX_URL) return res.status(500).json({ error: "UNITYNODES_INDEX_URL not configured" });
+  try {
+    if (!UNITYNODES_INDEX_URL) {
+      return res.status(500).json({ error: "UNITYNODES_INDEX_URL not configured" });
+    }
 
-  const current = await getLatest();
-  const found = await scrapeUnityNodesIndexForLatest(UNITYNODES_INDEX_URL);
-  if (!found) return res.status(500).json({ error: "scrape failed" });
+    const current = await getLatest();
+    const found = await scrapeUnityNodesIndexForLatest(UNITYNODES_INDEX_URL);
+    if (!found) return res.status(500).json({ error: "scrape failed" });
 
-  const isNew = !current || current.apkUrl !== found.apkUrl;
-  if (!isNew) return res.json({ ok: true, isNew: false, latest: current });
+    // "New" means the APK URL changed (a new artifact is available).
+    const isNew = !current || current.apkUrl !== found.apkUrl;
 
-  const sha256 = await sha256OfUrl(found.apkUrl);
+    // Refresh Firestore even when the APK URL is the same, if any metadata changed.
+    // This prevents stale fields from lingering when we tweak parsing/formatting logic.
+    const needsRefresh =
+      !current ||
+      current.apkUrl !== found.apkUrl ||
+      current.fileName !== found.fileName ||
+      current.versionName !== found.versionName ||
+      current.publishedAt !== found.publishedAt ||
+      Number(current.sizeBytes) !== Number(found.sizeBytes);
 
-  const latest = {
-    versionName: found.versionName,
-    apkUrl: found.apkUrl,
-    fileName: found.fileName,
-    publishedAt: found.publishedAt,
-    sizeBytes: found.sizeBytes,
-    sha256,
-    updatedAt: new Date().toISOString()
-  };
+    if (!needsRefresh) {
+        const latest = {
+            ...current,
+            checkedAt: new Date().toISOString()
+        };
 
-  await setLatest(latest);
+        // Optional: persist checkedAt so /latest.json reflects liveness
+        await setLatest(latest);
 
-  const pushed = await sendPushToTokens({
-    title: "UnityNodes update available",
-    body: `New APK: ${latest.versionName}`,
-    data: { versionName: latest.versionName, apkUrl: latest.apkUrl }
-  });
+        return res.json({ ok: true, isNew: false, latest });
+    }
 
-  res.json({ ok: true, isNew: true, latest, pushed });
+    // Only compute SHA when the underlying APK changes or we don't have it yet.
+    // (If we don't have current, or if current.sha256 is missing, compute it.)
+    const sha256 =
+      !current || isNew || !current.sha256 ? await sha256OfUrl(found.apkUrl) : current.sha256;
+
+    const latest = {
+        versionName: found.versionName,
+        apkUrl: found.apkUrl,
+        fileName: found.fileName,
+        publishedAt: found.publishedAt,
+        sizeBytes: found.sizeBytes,
+        sha256,
+        updatedAt: new Date().toISOString(),
+        checkedAt: new Date().toISOString()
+    };
+
+    await setLatest(latest);
+
+    // Push is best-effort; it should not prevent updating Firestore.
+    let pushed = null;
+    try {
+      pushed = await sendPushToTokens({
+        title: "UnityNodes update available",
+        body: `New APK: ${latest.versionName}`,
+        data: { versionName: latest.versionName, apkUrl: latest.apkUrl }
+      });
+    } catch (err) {
+      console.error("FCM push failed (continuing):", err);
+      pushed = { ok: false, error: String(err?.message || err) };
+    }
+
+    res.json({ ok: true, isNew, latest, pushed });
+  } catch (err) {
+    console.error("SCRAPE ERROR:", err);
+    res.status(500).json({ error: "scrape crashed", details: String(err?.message || err) });
+  }
 });
 
 app.listen(PORT, () => console.log(`Backend listening on :${PORT}`));
