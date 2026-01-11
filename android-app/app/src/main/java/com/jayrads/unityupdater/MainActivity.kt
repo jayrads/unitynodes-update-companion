@@ -1,14 +1,12 @@
 package com.jayrads.unityupdater
 
 import android.Manifest
-import android.content.ClipData
-import android.content.ClipboardManager
+import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
+import android.database.Cursor
 import android.os.Build
 import android.os.Bundle
-import android.util.Log
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -23,18 +21,17 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.firebase.FirebaseApp
 import com.google.firebase.messaging.FirebaseMessaging
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -66,6 +63,7 @@ class MainActivity : ComponentActivity() {
 private fun StatusScreen(onRequestNotificationPermission: () -> Unit) {
     val ctx = LocalContext.current
     val activity = ctx as ComponentActivity
+    val downloadManager = remember { ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager }
 
     var installed by remember {
         mutableStateOf(TargetAppVersion.getInstalled(ctx, "io.unitynodes.unityapp"))
@@ -78,6 +76,11 @@ private fun StatusScreen(onRequestNotificationPermission: () -> Unit) {
     var isVerifying by remember { mutableStateOf(Prefs.isVerifying(ctx)) }
     var pendingInstall by remember { mutableStateOf(Prefs.getPendingInstall(ctx)) }
     var downloadedPath by remember { mutableStateOf(Prefs.getApkPath(ctx)) }
+
+    // --- NEW STATES FOR DOWNLOADING ---
+    var isDownloading by remember { mutableStateOf(false) }
+    var downloadProgress by remember { mutableStateOf(0f) }
+    var currentDownloadId by remember { mutableStateOf(-1L) }
 
     var detailsExpanded by remember { mutableStateOf(false) }
 
@@ -99,6 +102,49 @@ private fun StatusScreen(onRequestNotificationPermission: () -> Unit) {
         }
     }
 
+    // --- NEW POLLING LOGIC ---
+    // Watches the download ID and updates progress / triggers refresh on completion
+    LaunchedEffect(currentDownloadId) {
+        if (currentDownloadId != -1L) {
+            isDownloading = true
+            while (isActive) {
+                val q = DownloadManager.Query().setFilterById(currentDownloadId)
+                val cursor: Cursor? = downloadManager.query(q)
+                if (cursor != null && cursor.moveToFirst()) {
+                    val bytesIndex = cursor.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+                    val totalIndex = cursor.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
+                    val statusIndex = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
+
+                    if (bytesIndex != -1 && totalIndex != -1) {
+                        val downloaded = cursor.getLong(bytesIndex)
+                        val total = cursor.getLong(totalIndex)
+                        if (total > 0) {
+                            downloadProgress = downloaded.toFloat() / total.toFloat()
+                        }
+                    }
+
+                    if (statusIndex != -1) {
+                        val status = cursor.getInt(statusIndex)
+                        if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                            isDownloading = false
+                            currentDownloadId = -1L
+                            refresh() // Reloads to show the Install button
+                        } else if (status == DownloadManager.STATUS_FAILED) {
+                            isDownloading = false
+                            currentDownloadId = -1L
+                        }
+                    }
+                } else {
+                    // Cursor empty usually means download cancelled or lost
+                    isDownloading = false
+                    currentDownloadId = -1L
+                }
+                cursor?.close()
+                delay(500) // Poll every 500ms
+            }
+        }
+    }
+
     LaunchedEffect(Unit) {
         if (FirebaseApp.getApps(ctx).isNotEmpty()) {
             FirebaseMessaging.getInstance().token.addOnSuccessListener {
@@ -113,8 +159,10 @@ private fun StatusScreen(onRequestNotificationPermission: () -> Unit) {
             latest!!.apkUrl.isNotBlank() &&
             isLatestNewer(installed, latest!!)
 
+    // Logic: Show install path, but ONLY if we aren't currently downloading a new one
     val installPath = pendingInstall ?: downloadedPath
     val isVerified = !pendingInstall.isNullOrBlank()
+    val showInstallButton = !installPath.isNullOrBlank() && !isDownloading
 
     Column(
         modifier = Modifier
@@ -128,6 +176,7 @@ private fun StatusScreen(onRequestNotificationPermission: () -> Unit) {
             title = "UnityNodes",
             subtitle = "Update Companion",
             status = when {
+                isDownloading -> "Downloading..."
                 updateAvailable -> "Update available"
                 isLoading -> "Checking…"
                 latest == null -> "Offline"
@@ -140,7 +189,7 @@ private fun StatusScreen(onRequestNotificationPermission: () -> Unit) {
                 val installedPretty = if (!installed.isInstalled) {
                     "Not installed"
                 } else {
-                    normalizeSemverString(installed.versionName) // drops "(14)" because we don’t show versionCode anymore
+                    normalizeSemverString(installed.versionName)
                 }
 
                 val latestPretty = when {
@@ -156,7 +205,12 @@ private fun StatusScreen(onRequestNotificationPermission: () -> Unit) {
                 KeyValue("Installed (UnityNodes)", installedPretty, big = true)
                 KeyValue("Latest", latestPretty, big = true)
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedButton(onClick = { refresh() }, Modifier.weight(1f)) {
+                    // Disable refresh while downloading to prevent state conflicts
+                    OutlinedButton(
+                        onClick = { refresh() },
+                        modifier = Modifier.weight(1f),
+                        enabled = !isDownloading
+                    ) {
                         Icon(Icons.Filled.Refresh, null)
                         Spacer(Modifier.width(6.dp))
                         Text("Refresh")
@@ -175,16 +229,50 @@ private fun StatusScreen(onRequestNotificationPermission: () -> Unit) {
             ElevatedCard {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
 
+                    // --- DOWNLOAD BUTTON ---
                     ElevatedButton(
                         onClick = {
                             ApkDownloader.enqueueLatest(ctx, latest!!)
                             isVerifying = Prefs.isVerifying(ctx)
+
+                            // Attempt to grab the latest download ID to start tracking
+                            // (Since ApkDownloader handles the enqueue, we query for the most recent one)
+                            val q = DownloadManager.Query().setFilterByStatus(
+                                DownloadManager.STATUS_PENDING or DownloadManager.STATUS_RUNNING
+                            )
+                            // We wait a tiny bit to ensure DownloadManager has registered it
+                            activity.lifecycleScope.launch {
+                                delay(200)
+                                val cursor = downloadManager.query(q)
+                                if (cursor.moveToFirst()) {
+                                    // Assuming the last one created is ours (safe bet for this app)
+                                    val idIndex = cursor.getColumnIndex(DownloadManager.COLUMN_ID)
+                                    if(idIndex != -1) {
+                                        currentDownloadId = cursor.getLong(idIndex)
+                                    }
+                                }
+                                cursor.close()
+                            }
                         },
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !isDownloading // Disable while downloading
                     ) {
                         Icon(Icons.Filled.Download, null)
                         Spacer(Modifier.width(8.dp))
-                        Text("Download update")
+                        Text(if(isDownloading) "Downloading..." else "Download update")
+                    }
+
+                    // --- PROGRESS BAR ---
+                    if (isDownloading) {
+                        LinearProgressIndicator(
+                            progress = { downloadProgress },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Text(
+                            text = "${(downloadProgress * 100).toInt()}%",
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.align(Alignment.CenterHorizontally)
+                        )
                     }
 
                     if (isVerifying) {
@@ -195,7 +283,9 @@ private fun StatusScreen(onRequestNotificationPermission: () -> Unit) {
                         }
                     }
 
-                    if (!installPath.isNullOrBlank()) {
+                    // --- INSTALL BUTTON ---
+                    // Hidden if downloading or if path is invalid
+                    if (showInstallButton) {
                         OutlinedButton(
                             onClick = {
                                 if (isVerified) Prefs.clearPendingInstall(ctx)
@@ -337,4 +427,3 @@ private fun normalizeSemverString(v: String?): String {
     val m = Regex("""(\d+)\.(\d+)\.(\d+)""").find(v) ?: return v
     return "${m.groupValues[1]}.${m.groupValues[2]}.${m.groupValues[3]}"
 }
-
